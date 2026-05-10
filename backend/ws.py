@@ -91,8 +91,12 @@ manager = ConnectionManager()
 # WebSocket helpers
 # ---------------------------------------------------------------------------
 
-def serialize_doc(doc: dict) -> dict:
-    doc = dict(doc)
+_READING_EXCLUDE  = {"salinity", "embedding", "text_repr"}
+_PREDICT_EXCLUDE  = {"embedding", "text_repr"}
+
+
+def serialize_doc(doc: dict, exclude: set = frozenset()) -> dict:
+    doc = {k: v for k, v in doc.items() if k not in exclude}
     if "_id" in doc:
         doc["_id"] = str(doc["_id"])
     if "sensor_reading_id" in doc:
@@ -123,7 +127,7 @@ async def get_sensor_history(db, sensor_id: str, n: int = 25) -> list:
         limit=n,
     ).to_list(length=n)
     docs.reverse()
-    return [serialize_doc(d) for d in docs]
+    return [serialize_doc(d, exclude=_READING_EXCLUDE) for d in docs]
 
 
 async def get_latest_prediction(db, sensor_id: str) -> dict | None:
@@ -131,12 +135,12 @@ async def get_latest_prediction(db, sensor_id: str) -> dict | None:
         {"sensor_id": sensor_id},
         sort=[("time", -1)],
     )
-    return serialize_doc(doc) if doc else None
+    return serialize_doc(doc, exclude=_PREDICT_EXCLUDE) if doc else None
 
 
-async def build_ws_payload(db, sensor_id: str) -> dict:
+async def build_ws_payload(db, sensor_id: str, n: int = 25) -> dict:
     online = await is_sensor_online(db, sensor_id)
-    history = await get_sensor_history(db, sensor_id, n=25)
+    history = await get_sensor_history(db, sensor_id, n=n)
     latest = history[-1] if history else None
     prediction = await get_latest_prediction(db, sensor_id)
     return {
@@ -264,7 +268,7 @@ async def process_reading(reading: SensorReading):
             await run_llm_prediction(recent, db)
 
         if manager.is_connected(reading.id):
-            payload = await build_ws_payload(db, reading.id)
+            payload = await build_ws_payload(db, reading.id, n=1)
             await manager.broadcast(reading.id, payload)
     except Exception as e:
         print(f"[process_reading] EXCEPTION for sensor_id={reading.id}: {e}", flush=True)
