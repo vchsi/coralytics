@@ -221,6 +221,7 @@ def build_rag_chain(sensor_id: str, system_prompt: str):
         temperature=0.4,
         max_tokens=512,
         streaming=True,
+        request_timeout=60,
     )
 
     prompt = ChatPromptTemplate.from_messages([
@@ -246,6 +247,9 @@ def build_rag_chain(sensor_id: str, system_prompt: str):
 # RAG runner (streams via queue)
 # ---------------------------------------------------------------------------
 
+_CHAIN_TIMEOUT = float(os.getenv("RAG_CHAIN_TIMEOUT", "90"))
+
+
 async def run_rag_chain(
     chain,
     message: str,
@@ -253,20 +257,31 @@ async def run_rag_chain(
     queue: asyncio.Queue,
     callback: SSECallbackHandler,
 ) -> None:
+    loop = asyncio.get_event_loop()
+
+    def _stream_tokens():
+        """Run in a thread pool — pushes each token into the asyncio queue as it arrives."""
+        try:
+            for token in chain.stream(message):
+                # thread-safe enqueue; put_nowait is safe for unbounded Queue
+                loop.call_soon_threadsafe(queue.put_nowait, token)
+        except Exception as e:
+            logger.exception("RAG chain error: %s", e)
+            short = str(e)[:200]
+            loop.call_soon_threadsafe(queue.put_nowait, f"\n\n_(LLM error: {short})_")
+        finally:
+            # sentinel: signals event_stream the generator is done
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+
     try:
-        loop = asyncio.get_event_loop()
-
-        def _stream():
-            return list(chain.stream(message))
-
-        tokens = await loop.run_in_executor(None, _stream)
-        for token in tokens:
-            await queue.put(token)
-    except Exception as e:
-        logger.exception("RAG chain error")
-        await queue.put(f"[Error: {e}]")
-    finally:
-        await queue.put(None)
+        await asyncio.wait_for(
+            loop.run_in_executor(None, _stream_tokens),
+            timeout=_CHAIN_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.error("RAG chain timed out after %.0fs", _CHAIN_TIMEOUT)
+        # Ensure sentinel is delivered even on timeout
+        loop.call_soon_threadsafe(queue.put_nowait, None)
 
 
 # ---------------------------------------------------------------------------
@@ -300,14 +315,24 @@ async def event_stream(
         run_rag_chain(chain, message, history, queue, callback)
     )
 
+    got_any = False
     while True:
-        token = await queue.get()
+        try:
+            token = await asyncio.wait_for(queue.get(), timeout=_CHAIN_TIMEOUT + 10)
+        except asyncio.TimeoutError:
+            task.cancel()
+            yield "data: [TIMEOUT]\n\n"
+            return
         if token is None:
             break
+        got_any = True
         yield f"data: {json.dumps({'token': token})}\n\n"
 
     await task
-    yield "data: [DONE]\n\n"
+    if not got_any:
+        yield "data: [TIMEOUT]\n\n"
+    else:
+        yield "data: [DONE]\n\n"
 
 
 # ---------------------------------------------------------------------------

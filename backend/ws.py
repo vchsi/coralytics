@@ -18,9 +18,13 @@ from mongodb_connector import get_db, motor_connect, motor_disconnect
 from polling import poll_sensor
 from rag import chat as rag_chat, ChatRequest
 from embeddings import embed, reading_text_repr, get_embedder
+from textbee_connector import send_sms
+from elevenlabs_connector import make_voice_call
 
 _sensor_reading_counts: dict[str, int] = defaultdict(int)
 _background_tasks: set = set()
+
+RISK_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -42,6 +46,74 @@ LLM_API_KEY = os.getenv("LLM_API_KEY", "testkey")
 TEXTBEE_API_KEY = os.getenv("TEXTBEE_API_KEY")
 TEXTBEE_DEVICE_ID = os.getenv("TEXTBEE_DEVICE_ID")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+ALERT_PHONE = os.getenv("ALERT_PHONE")  # fallback when no user record exists
+
+# ---------------------------------------------------------------------------
+# Alert helpers
+# ---------------------------------------------------------------------------
+
+def build_sms_message(user_name: str, sensor_id: str, prediction: dict, alert_type: str, is_all_clear: bool = False) -> str:
+    if is_all_clear:
+        return (
+            f"Coral Reef All-Clear - Sensor {sensor_id}\n"
+            f"Risk has returned to LOW. No immediate action required."
+        )
+    notice = prediction["notices"][0] if prediction.get("notices") else ""
+    return (
+        f"Coral Reef Alert [{alert_type.upper()}] - Sensor {sensor_id}\n"
+        f"Risk: {prediction['risk_level'].upper()} | "
+        f"Bleaching: {prediction['bleaching_pct']}%\n"
+        f"{notice}"
+    )[:160]
+
+
+async def dispatch_alert(db, sensor_id: str, prediction: dict, user: dict, alert_level: str, is_all_clear: bool = False) -> None:
+    message = build_sms_message(user.get("name", ""), sensor_id, prediction, alert_level, is_all_clear)
+    phone = user["phone"]
+
+    sms_result = False
+    call_result = None
+
+    if alert_level in ("sms",) or is_all_clear:
+        sms_result = await send_sms(phone, message)
+        if not sms_result:
+            logger.warning("SMS send failed for sensor_id=%s phone=%s", sensor_id, phone)
+
+    if alert_level == "call":
+        sms_result = await send_sms(phone, message)
+        if not sms_result:
+            logger.warning("SMS alongside call failed for sensor_id=%s phone=%s", sensor_id, phone)
+        call_result = await make_voice_call(phone, sensor_id, prediction)
+        if not call_result:
+            logger.warning("Voice call failed for sensor_id=%s phone=%s", sensor_id, phone)
+
+    now = datetime.utcnow()
+    await db.alerts.insert_one({
+        "sensor_id":          sensor_id,
+        "timestamp":          now,
+        "alert_level":        alert_level,
+        "is_all_clear":       is_all_clear,
+        "risk_level":         prediction["risk_level"],
+        # Use the canonical field name the frontend expects
+        "bleaching_risk_pct": prediction.get("bleaching_pct", 0.0),
+        "risk_7d":            prediction.get("risk_7d", 0.0),
+        "risk_14d":           prediction.get("risk_14d", 0.0),
+        "alert_description":  prediction.get("risk_description", ""),
+        "user_id":            user.get("user_id"),
+        "phone":              phone,
+        "message_sent":       message,
+        "sms_success":        sms_result,
+        "call_success":       call_result if alert_level == "call" else None,
+    })
+
+    # Note: predictions is a timeseries collection — skip update_one to avoid
+    # datetime/string type mismatch and timeseries mutation restrictions.
+
+    logger.info(
+        "Alert fired: sensor_id=%s level=%s all_clear=%s sms_ok=%s call_ok=%s",
+        sensor_id, alert_level, is_all_clear, sms_result, call_result,
+    )
+
 
 app = FastAPI(title="Coral Reef Sensor Monitoring API")
 
@@ -197,8 +269,10 @@ async def process_reading(reading: SensorReading):
         temperature_k = reading.temperature + 273.15
         sst_k = reading.sst + 273.15
         ssta = reading.sst - sensor["clim_sst"]
+        # turbidity_scaled: 0-10 clarity index (10 = crystal clear, 0 = very murky)
         turbidity_scaled = (1 - (reading.turbidity / 5.0)) * 10
-        k = 0.1 + (turbidity_scaled / 10) * 0.9
+        # k uses raw NTU so that higher turbidity → more light attenuation → less light at depth
+        k = 0.1 + (reading.turbidity / 5.0) * 0.9
         light_at_depth = reading.surface_light * math.exp(-k * sensor["depth"])
         now = datetime.utcnow()
         month = now.month
@@ -266,6 +340,38 @@ async def process_reading(reading: SensorReading):
             ).to_list(length=LLM_WINDOW)
             recent.reverse()
             await run_llm_prediction(recent, db)
+
+            # Alert check — runs after prediction is inserted
+            try:
+                pred_doc = await db.predictions.find_one(
+                    {"sensor_id": reading.id},
+                    sort=[("time", -1)],
+                )
+                if pred_doc:
+                    last_alert = await db.alerts.find_one(
+                        {"sensor_id": reading.id},
+                        sort=[("timestamp", -1)],
+                    )
+                    last_level = last_alert["alert_level"] if last_alert else None
+                    risk_level = pred_doc["risk_level"]
+                    current_order = RISK_ORDER[risk_level]
+
+                    user = await db.users.find_one({"registered_sensors": reading.id})
+                    if not user and ALERT_PHONE:
+                        user = {"phone": ALERT_PHONE, "name": "Admin", "user_id": None}
+                        logger.info("No user for sensor_id=%s, falling back to ALERT_PHONE", reading.id)
+                    if user:
+                        prediction = serialize_doc(pred_doc, exclude=_PREDICT_EXCLUDE)
+                        if risk_level == "critical" and last_level != "call":
+                            await dispatch_alert(db, reading.id, prediction, user, "call")
+                        elif current_order >= RISK_ORDER["medium"] and last_level not in ("sms", "call"):
+                            await dispatch_alert(db, reading.id, prediction, user, "sms")
+                        elif risk_level == "low" and last_level is not None:
+                            await dispatch_alert(db, reading.id, prediction, user, "sms", is_all_clear=True)
+                    else:
+                        logger.warning("No user or ALERT_PHONE for sensor_id=%s, skipping alert dispatch", reading.id)
+            except Exception:
+                logger.exception("Alert dispatch failed for sensor_id=%s", reading.id)
 
         if manager.is_connected(reading.id):
             payload = await build_ws_payload(db, reading.id, n=1)
@@ -370,7 +476,28 @@ async def set_thresholds(body: dict):
 
 @app.post("/settings/contact")
 async def set_contact(body: dict):
-    return {"status": "not implemented"}
+    phone = body.get("phone", "").strip()
+    name  = body.get("name",  "").strip()
+    if not phone:
+        return {"status": "error", "message": "Phone number required"}
+
+    # Update live process immediately
+    global ALERT_PHONE
+    ALERT_PHONE = phone
+    os.environ["ALERT_PHONE"] = phone
+
+    # Persist to .env so the value survives restarts
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    try:
+        from dotenv import set_key
+        set_key(env_path, "ALERT_PHONE", phone)
+        if name:
+            set_key(env_path, "ALERT_NAME", name)
+    except Exception as e:
+        logger.warning("Could not write to .env: %s", e)
+
+    logger.info("ALERT_PHONE updated to %s", phone)
+    return {"status": "ok", "phone": phone, "name": name}
 
 
 class AlertPayload(BaseModel):
@@ -404,13 +531,31 @@ async def create_alert(body: AlertPayload):
 
 
 @app.get("/alerts")
-async def get_alerts(limit: int = 200):
+async def get_alerts(sensor_id: str | None = None, limit: int = 50, skip: int = 0):
     db = get_db()
-    docs = await db.alerts.find({}, sort=[("timestamp", -1)], limit=limit).to_list(length=limit)
+    query = {"sensor_id": sensor_id} if sensor_id else {}
+    total = await db.alerts.count_documents(query)
+    docs = await db.alerts.find(
+        query,
+        sort=[("timestamp", -1)],
+        skip=skip,
+        limit=limit,
+    ).to_list(length=limit)
     return {
-        "count":  len(docs),
-        "alerts": [serialize_doc(d) for d in docs],
+        "sensor_id": sensor_id,
+        "total":     total,
+        "count":     len(docs),
+        "alerts":    [serialize_doc(d) for d in docs],
     }
+
+
+@app.post("/test-sms")
+async def test_sms_endpoint(body: dict):
+    phone = body.get("phone", "").strip()
+    if not phone:
+        return {"status": "error", "message": "Phone number required"}
+    result = await send_sms(phone, "Test alert from Coralytics — your SMS notifications are working correctly.")
+    return {"status": "ok" if result else "error", "sent": result}
 
 
 @app.get("/health")
