@@ -284,9 +284,36 @@ async def ingest(payload: IngestPayload):
     return {"status": "accepted", "count": len(payload.sensor_values)}
 
 
+@app.get("/sensors/{sensor_id}/predictions")
+async def sensor_predictions(sensor_id: str, limit: int = 50):
+    db = get_db()
+    docs = await db.predictions.find(
+        {"sensor_id": sensor_id},
+        sort=[("time", -1)],
+        limit=limit,
+    ).to_list(length=limit)
+    docs.reverse()
+    return {
+        "sensor_id": sensor_id,
+        "count": len(docs),
+        "predictions": [serialize_doc(d, exclude=_PREDICT_EXCLUDE) for d in docs],
+    }
+
+
 @app.get("/sensors/{sensor_id}/history")
 async def sensor_history(sensor_id: str, limit: int = 50):
-    return {"status": "not implemented"}
+    db = get_db()
+    docs = await db.sensor_readings.find(
+        {"sensor_id": sensor_id},
+        sort=[("time", -1)],
+        limit=limit,
+    ).to_list(length=limit)
+    docs.reverse()
+    return {
+        "sensor_id": sensor_id,
+        "count": len(docs),
+        "history": [serialize_doc(d, exclude=_READING_EXCLUDE) for d in docs],
+    }
 
 
 @app.post("/predict/{sensor_id}")
@@ -346,9 +373,44 @@ async def set_contact(body: dict):
     return {"status": "not implemented"}
 
 
+class AlertPayload(BaseModel):
+    sensor_id: str
+    alert_level: str          # "sms" | "call"
+    alert_description: str
+    bleaching_risk_pct: float
+    risk_7d: float
+    risk_14d: float
+    risk_level: str
+
+
+@app.post("/alerts", status_code=201)
+async def create_alert(body: AlertPayload):
+    db = get_db()
+    now = datetime.utcnow()
+    doc = {
+        "timestamp":          now,
+        "sensor_id":          body.sensor_id,
+        "alert_level":        body.alert_level,
+        "alert_description":  body.alert_description,
+        "bleaching_risk_pct": body.bleaching_risk_pct,
+        "risk_7d":            body.risk_7d,
+        "risk_14d":           body.risk_14d,
+        "risk_level":         body.risk_level,
+    }
+    result = await db.alerts.insert_one(doc)
+    doc["_id"]       = str(result.inserted_id)
+    doc["timestamp"] = now.isoformat()
+    return doc
+
+
 @app.get("/alerts")
-async def get_alerts():
-    return {"status": "not implemented"}
+async def get_alerts(limit: int = 200):
+    db = get_db()
+    docs = await db.alerts.find({}, sort=[("timestamp", -1)], limit=limit).to_list(length=limit)
+    return {
+        "count":  len(docs),
+        "alerts": [serialize_doc(d) for d in docs],
+    }
 
 
 @app.get("/health")
