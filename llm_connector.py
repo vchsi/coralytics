@@ -1,21 +1,23 @@
+from __future__ import annotations
+
 import json
 import logging
 import os
 import time as _time
-from collections import defaultdict, deque
 from datetime import datetime
 
 import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from embeddings import embed, prediction_text_repr  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 VULTR_LLM_URL = os.getenv("VULTR_LLM_URL", "http://localhost:8080/v1")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "testkey")
-LLM_CALL_INTERVAL = int(os.getenv("LLM_CALL_INTERVAL", "5"))
-
-# Per-sensor rolling buffer (oldest→newest) and call counter
-_doc_buffers: dict[str, deque] = defaultdict(lambda: deque(maxlen=LLM_CALL_INTERVAL))
-_sensor_counters: dict[str, int] = defaultdict(int)
+LLM_WINDOW = 5
 
 FALLBACKS = {
     "low": {
@@ -158,22 +160,17 @@ def _build_user_prompt(docs: list[dict], risk_level: str, bleaching_pct: float,
     return header + table_header + rows + latest_detail + risk_detail
 
 
-async def maybe_run_llm(doc: dict, db) -> None:
-    sensor_id = doc["sensor_id"]
-    _doc_buffers[sensor_id].append(doc)
-    _sensor_counters[sensor_id] += 1
-    if _sensor_counters[sensor_id] % LLM_CALL_INTERVAL != 0:
-        return
-    await _run_llm_prediction(list(_doc_buffers[sensor_id]), db)
-
-
-async def _run_llm_prediction(docs: list[dict], db) -> None:
+async def run_llm_prediction(docs: list[dict], db) -> None:
     if not docs:
         return
     latest = docs[-1]
     try:
         risk_level, bleaching_pct, bleaching_event, bleaching_level = _compute_risk(latest)
         user_prompt = _build_user_prompt(docs, risk_level, bleaching_pct, bleaching_event, bleaching_level)
+
+        logger.info(">>> LLM polling sensor_id=%s | window=%d | risk=%s (%.1f%%)",
+                    latest["sensor_id"], len(docs), risk_level, bleaching_pct)
+        print(f">>> LLM polling sensor_id={latest['sensor_id']} | window={len(docs)} | risk={risk_level} ({bleaching_pct}%)", flush=True)
 
         t0 = _time.monotonic()
         async with httpx.AsyncClient(timeout=30) as client:
@@ -222,7 +219,7 @@ async def _run_llm_prediction(docs: list[dict], db) -> None:
             "latency_ms": latency_ms,
         })
 
-        result = await db.predictions.insert_one({
+        pred_doc = {
             "time": latest["time"],
             "sensor_id": latest["sensor_id"],
             "sensor_reading_ids": [d["_id"] for d in docs],
@@ -237,8 +234,32 @@ async def _run_llm_prediction(docs: list[dict], db) -> None:
             "risk_14d": risk_14d,
             "alert_sent": False,
             "alert_type": None,
-        })
-        logger.info("Inserted prediction for sensor_id=%s id=%s (window=%d)", latest["sensor_id"], result.inserted_id, len(docs))
+        }
+        text_repr = prediction_text_repr(pred_doc)
+        import asyncio as _asyncio
+        loop = _asyncio.get_event_loop()
+        embedding = await loop.run_in_executor(None, embed, text_repr)
+        pred_doc["text_repr"] = text_repr
+        pred_doc["embedding"] = embedding
+        result = await db.predictions.insert_one(pred_doc)
+        print(json.dumps({
+            "_id": str(result.inserted_id),
+            "time": latest["time"].isoformat(),
+            "sensor_id": latest["sensor_id"],
+            "sensor_reading_ids": [str(d["_id"]) for d in docs],
+            "bleaching_pct": bleaching_pct,
+            "bleaching_level": bleaching_level,
+            "bleaching_event": bleaching_event,
+            "risk_level": risk_level,
+            "risk_description": risk_description,
+            "notices": notices,
+            "next_steps": next_steps,
+            "risk_7d": risk_7d,
+            "risk_14d": risk_14d,
+            "alert_sent": False,
+            "alert_type": None,
+            "_meta": {"latency_ms": latency_ms, "fallback_used": not parse_success},
+        }, indent=2), flush=True)
 
     except Exception:
         logger.exception("LLM prediction failed for sensor_id=%s", latest.get("sensor_id"))

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import os
 
@@ -8,18 +10,31 @@ from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 
 load_dotenv()
 
+# Make Python use certifi's CA bundle (fixes CERTIFICATE_VERIFY_FAILED on macOS)
+os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+
 logger = logging.getLogger(__name__)
 
-MONGO_URI = os.getenv("MONGODB_URL")
+MONGO_URL = os.getenv("MONGODB_URL")
 MONGO_CLUSTER_NAME = os.getenv("MONGODB_NAME", "hackdavisdb")
 
 _motor_client: AsyncIOMotorClient | None = None
 _motor_db: AsyncIOMotorDatabase | None = None
+_sync_client: pymongo.MongoClient | None = None
+
+
+def get_sync_collection(collection_name: str):
+    """Return a synchronous pymongo Collection — for use with LangChain vectorstores."""
+    global _sync_client
+    if _sync_client is None:
+        _sync_client = pymongo.MongoClient(MONGO_URL, tlsCAFile=certifi.where())
+    return _sync_client[MONGO_CLUSTER_NAME][collection_name]
 
 
 async def motor_connect() -> AsyncIOMotorDatabase:
     global _motor_client, _motor_db
-    _motor_client = AsyncIOMotorClient(MONGO_URI, tlsCAFile=certifi.where())
+    _motor_client = AsyncIOMotorClient(MONGO_URL)
     _motor_db = _motor_client[MONGO_CLUSTER_NAME]
     logger.info("Connected to MongoDB database '%s'", MONGO_CLUSTER_NAME)
     return _motor_db

@@ -7,7 +7,7 @@ def sensors():
     return {"sensor_values": [
         {"id": "1",
          "temperature": 22.5,
-         "ph": 7.2,
+         "ph": 7.2, 
          "turbidity": 0.8,
          "surface_light": 300,
          "sst": 25.0}]}
