@@ -1,8 +1,38 @@
 
+import logging
+import os
 
+import httpx
 import requests
 from dotenv import load_dotenv
-import os
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+_TEXTBEE_BASE = "https://api.textbee.dev/api/v1"
+
+
+async def send_sms(phone: str, message: str) -> bool:
+    api_key = os.getenv("TEXTBEE_API_KEY")
+    device_id = os.getenv("TEXTBEE_DEVICE_ID")
+    if not api_key or not device_id:
+        logger.error("TextBee credentials not configured")
+        return False
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{_TEXTBEE_BASE}/gateway/devices/{device_id}/send-sms",
+                headers={"x-api-key": api_key},
+                json={"recipients": [phone], "message": message},
+                timeout=10.0,
+            )
+            response.raise_for_status()
+            logger.info("SMS sent to %s", phone)
+            return True
+    except Exception as e:
+        logger.error("SMS failed: %s", e)
+        return False
 
 
 class TextBeeConnector:
@@ -21,8 +51,6 @@ class TextBeeConnector:
     """
 
     def __init__(self, project_env=".env"):
-
-        load_dotenv()
         self.TEXTBEE_API_KEY = os.getenv("TEXTBEE_API_KEY")
         self.TEXTBEE_DEVICE_ID = os.getenv("TEXTBEE_DEVICE_ID")
         print(self.TEXTBEE_API_KEY, self.TEXTBEE_DEVICE_ID)
