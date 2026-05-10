@@ -63,7 +63,7 @@ Respond ONLY with valid JSON in this exact format:
 
 Fields:
 - risk_description: 1-2 sentence summary of current reef health status
-- notices: 2-4 specific observations derived from the trend across all provided readings
+- notices: 2-4 specific observations derived  from the trend across all provided readings
 - next_steps: 2-4 actionable recommendations ordered by urgency
 - risk_7d: predicted bleaching risk % in 7 days (0-100), based on observed SSTA/DHW trend across the reading window and historical reef patterns
 - risk_14d: predicted bleaching risk % in 14 days (0-100), incorporating seasonal context, month, and multi-week thermal trajectory
