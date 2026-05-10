@@ -171,39 +171,46 @@ async def build_system_prompt(sensor_id: str, db, include_forecast: bool) -> str
 
 
 # ---------------------------------------------------------------------------
+# Vectorstore cache — rebuilt once per sensor, reused across requests
+# ---------------------------------------------------------------------------
+
+_vectorstore_cache: dict[str, object] = {}
+
+
+def _get_vectorstore(sensor_id: str):
+    if sensor_id not in _vectorstore_cache:
+        from langchain_community.vectorstores import MongoDBAtlasVectorSearch
+        from langchain_core.embeddings import Embeddings
+        from mongodb_connector import get_sync_collection
+
+        class STEmbeddings(Embeddings):
+            def embed_documents(self, texts: list[str]) -> list[list[float]]:
+                return _get_embedder().encode(texts, convert_to_numpy=True).tolist()
+            def embed_query(self, text: str) -> list[float]:
+                return _get_embedder().encode([text], convert_to_numpy=True)[0].tolist()
+
+        _vectorstore_cache[sensor_id] = MongoDBAtlasVectorSearch(
+            collection=get_sync_collection("sensor_embeddings"),
+            embedding=STEmbeddings(),
+            index_name="sensor_embeddings_vector_index",
+            text_key="text_repr",
+            embedding_key="embedding",
+        )
+    return _vectorstore_cache[sensor_id]
+
+
+# ---------------------------------------------------------------------------
 # RAG chain builder
 # ---------------------------------------------------------------------------
 
 def build_rag_chain(sensor_id: str, system_prompt: str):
     from langchain_openai import ChatOpenAI
-    from langchain_community.vectorstores import MongoDBAtlasVectorSearch
     from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
     from langchain_core.output_parsers import StrOutputParser
     from langchain_core.runnables import RunnablePassthrough
-    from langchain_core.embeddings import Embeddings
-
     from llm_connector import VULTR_LLM_URL, LLM_API_KEY
-    from mongodb_connector import get_sync_collection
 
-    class STEmbeddings(Embeddings):
-        def embed_documents(self, texts: list[str]) -> list[list[float]]:
-            model = _get_embedder()
-            return model.encode(texts, convert_to_numpy=True).tolist()
-
-        def embed_query(self, text: str) -> list[float]:
-            model = _get_embedder()
-            return model.encode([text], convert_to_numpy=True)[0].tolist()
-
-    embeddings = STEmbeddings()
-
-    vectorstore = MongoDBAtlasVectorSearch(
-        collection=get_sync_collection("sensor_embeddings"),
-        embedding=embeddings,
-        index_name="sensor_embeddings_vector_index",
-        text_key="text_repr",
-        embedding_key="embedding",
-    )
-    retriever = vectorstore.as_retriever(
+    retriever = _get_vectorstore(sensor_id).as_retriever(
         search_kwargs={"k": RAG_K, "pre_filter": {"sensor_id": {"$eq": sensor_id}}}
     )
 
@@ -248,11 +255,12 @@ async def run_rag_chain(
 ) -> None:
     try:
         loop = asyncio.get_event_loop()
-        answer = await loop.run_in_executor(
-            None,
-            lambda: chain.invoke(message),
-        )
-        for token in answer:
+
+        def _stream():
+            return list(chain.stream(message))
+
+        tokens = await loop.run_in_executor(None, _stream)
+        for token in tokens:
             await queue.put(token)
     except Exception as e:
         logger.exception("RAG chain error")
@@ -272,12 +280,16 @@ async def event_stream(
     db,
 ) -> AsyncIterator[str]:
     include_forecast = detect_forecast_intent(message)
-    system_prompt = await build_system_prompt(sensor_id, db, include_forecast)
 
     queue: asyncio.Queue = asyncio.Queue()
     callback = SSECallbackHandler(queue)
 
     try:
+        # Build system prompt and warm the vectorstore cache in parallel
+        system_prompt, _ = await asyncio.gather(
+            build_system_prompt(sensor_id, db, include_forecast),
+            asyncio.get_event_loop().run_in_executor(None, _get_vectorstore, sensor_id),
+        )
         chain = build_rag_chain(sensor_id, system_prompt)
     except Exception as e:
         logger.exception("Failed to build RAG chain")

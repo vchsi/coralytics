@@ -64,17 +64,89 @@ class ConnectionManager:
         logger.info("WebSocket connected for sensor %s", sensor_id)
 
     def disconnect(self, websocket: WebSocket, sensor_id: str):
-        connections = self.active_connections.get(sensor_id, [])
-        if websocket in connections:
-            connections.remove(websocket)
+        conns = self.active_connections.get(sensor_id, [])
+        if websocket in conns:
+            conns.remove(websocket)
         logger.info("WebSocket disconnected for sensor %s", sensor_id)
 
     async def broadcast(self, sensor_id: str, data: dict):
-        for ws in self.active_connections.get(sensor_id, []):
-            await ws.send_text(json.dumps(data))
+        conns = self.active_connections.get(sensor_id, [])
+        dead = []
+        for ws in conns:
+            try:
+                await ws.send_json(data)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(ws, sensor_id)
+
+    def is_connected(self, sensor_id: str) -> bool:
+        return bool(self.active_connections.get(sensor_id))
 
 
 manager = ConnectionManager()
+
+
+# ---------------------------------------------------------------------------
+# WebSocket helpers
+# ---------------------------------------------------------------------------
+
+def serialize_doc(doc: dict) -> dict:
+    doc = dict(doc)
+    if "_id" in doc:
+        doc["_id"] = str(doc["_id"])
+    if "sensor_reading_id" in doc:
+        doc["sensor_reading_id"] = str(doc["sensor_reading_id"])
+    for field in ("timestamp", "time"):
+        if field in doc and isinstance(doc[field], datetime):
+            doc[field] = doc[field].isoformat()
+    if "sensor_reading_ids" in doc:
+        doc["sensor_reading_ids"] = [str(i) for i in doc["sensor_reading_ids"]]
+    return doc
+
+
+async def is_sensor_online(db, sensor_id: str) -> bool:
+    sensor = await db.sensors.find_one({"sensor_id": sensor_id, "online": True})
+    if not sensor:
+        return False
+    cutoff = datetime.utcnow() - timedelta(seconds=60)
+    recent = await db.sensor_readings.find_one(
+        {"sensor_id": sensor_id, "time": {"$gte": cutoff}}
+    )
+    return recent is not None
+
+
+async def get_sensor_history(db, sensor_id: str, n: int = 25) -> list:
+    docs = await db.sensor_readings.find(
+        {"sensor_id": sensor_id},
+        sort=[("time", -1)],
+        limit=n,
+    ).to_list(length=n)
+    docs.reverse()
+    return [serialize_doc(d) for d in docs]
+
+
+async def get_latest_prediction(db, sensor_id: str) -> dict | None:
+    doc = await db.predictions.find_one(
+        {"sensor_id": sensor_id},
+        sort=[("time", -1)],
+    )
+    return serialize_doc(doc) if doc else None
+
+
+async def build_ws_payload(db, sensor_id: str) -> dict:
+    online = await is_sensor_online(db, sensor_id)
+    history = await get_sensor_history(db, sensor_id, n=25)
+    latest = history[-1] if history else None
+    prediction = await get_latest_prediction(db, sensor_id)
+    return {
+        "sensor_id": sensor_id,
+        "status": "online" if online else "offline",
+        "latest": latest,
+        "prediction": prediction,
+        "history": history,
+        "server_time": datetime.utcnow().isoformat(),
+    }
 
 
 
@@ -96,6 +168,7 @@ async def startup():
             timeseries={"timeField": "time", "metaField": "sensor_id", "granularity": "seconds"},
         )
         logger.info("Created time series collection 'predictions'")
+    app.state.db = db
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, get_embedder)
     logger.info("Embedding model loaded")
@@ -171,6 +244,12 @@ async def process_reading(reading: SensorReading):
             "embedding": embedding,
         })
 
+        await db.sensors.update_one(
+            {"sensor_id": reading.id},
+            {"$set": {"online": True, "last_seen": now}},
+            upsert=False,
+        )
+
         _sensor_reading_counts[reading.id] += 1
         count = _sensor_reading_counts[reading.id]
         print(f"[sensor {reading.id}] inserted reading #{count} (LLM fires at multiples of {LLM_WINDOW})", flush=True)
@@ -183,6 +262,10 @@ async def process_reading(reading: SensorReading):
             ).to_list(length=LLM_WINDOW)
             recent.reverse()
             await run_llm_prediction(recent, db)
+
+        if manager.is_connected(reading.id):
+            payload = await build_ws_payload(db, reading.id)
+            await manager.broadcast(reading.id, payload)
     except Exception as e:
         print(f"[process_reading] EXCEPTION for sensor_id={reading.id}: {e}", flush=True)
         logger.exception("Error processing reading for sensor_id=%s", reading.id)
@@ -235,6 +318,8 @@ async def predict(sensor_id: str):
 @app.websocket("/ws/{sensor_id}")
 async def websocket_endpoint(websocket: WebSocket, sensor_id: str):
     await manager.connect(websocket, sensor_id)
+    snapshot = await build_ws_payload(app.state.db, sensor_id)
+    await websocket.send_json(snapshot)
     try:
         while True:
             await websocket.receive_text()

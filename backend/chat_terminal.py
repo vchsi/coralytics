@@ -72,22 +72,36 @@ async def _show_vector_hits(sensor_id: str, query: str):
 
 
 async def _answer(sensor_id: str, message: str, history: list[dict]) -> str:
-    """Run the full RAG chain and stream the answer to stdout."""
-    from rag import build_system_prompt, build_rag_chain, detect_forecast_intent
+    """Run the full RAG chain, streaming tokens to stdout as they arrive."""
+    from rag import build_system_prompt, build_rag_chain, detect_forecast_intent, _get_vectorstore
     from mongodb_connector import get_db
 
     db = get_db()
     include_forecast = detect_forecast_intent(message)
-    system_prompt = await build_system_prompt(sensor_id, db, include_forecast)
+
+    system_prompt, _ = await asyncio.gather(
+        build_system_prompt(sensor_id, db, include_forecast),
+        asyncio.get_event_loop().run_in_executor(None, _get_vectorstore, sensor_id),
+    )
 
     if include_forecast:
         print("  [forecast context included]")
 
     chain = build_rag_chain(sensor_id, system_prompt)
 
+    tokens = []
     loop = asyncio.get_event_loop()
-    answer = await loop.run_in_executor(None, lambda: chain.invoke(message))
-    return answer
+
+    def _stream():
+        result = []
+        for token in chain.stream(message):
+            print(token, end="", flush=True)
+            result.append(token)
+        return result
+
+    tokens = await loop.run_in_executor(None, _stream)
+    print()
+    return "".join(tokens)
 
 
 async def main():
@@ -126,10 +140,10 @@ async def main():
         await _show_vector_hits(SENSOR_ID, user_input)
 
         # Stream LLM answer
-        print(f"\n  Assistant:\n")
+        print(f"\n  Assistant:\n  ")
         try:
             answer = await _answer(SENSOR_ID, user_input, history)
-            print(f"  {answer}\n")
+            print()
             history.append({"role": "user",      "content": user_input})
             history.append({"role": "assistant", "content": answer})
         except Exception as e:
