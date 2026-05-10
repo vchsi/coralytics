@@ -17,7 +17,7 @@ from llm_connector import run_llm_prediction, LLM_WINDOW
 from mongodb_connector import get_db, motor_connect, motor_disconnect
 from polling import poll_sensor
 from rag import chat as rag_chat, ChatRequest
-from embeddings import embed, reading_text_repr
+from embeddings import embed, reading_text_repr, get_embedder
 
 _sensor_reading_counts: dict[str, int] = defaultdict(int)
 _background_tasks: set = set()
@@ -96,6 +96,9 @@ async def startup():
             timeseries={"timeField": "time", "metaField": "sensor_id", "granularity": "seconds"},
         )
         logger.info("Created time series collection 'predictions'")
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, get_embedder)
+    logger.info("Embedding model loaded")
     app.state.poll_task = asyncio.create_task(poll_sensor())
 
 
